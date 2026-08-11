@@ -1,14 +1,18 @@
 import asyncio
 import httpx
 import json
-from sqlalchemy.orm import Session
-from app import config, crud, state
-from app.database import SessionLocal
+from datetime import datetime
+from app import config, state
+from app.websocket_manager import manager
+
 
 async def poll_reader():
-    """Фоновый цикл опроса считывателя (инвентаризация)."""
+    """
+    Фоновый опрос считывателя.
+    Формирует JSON с данными меток, временем и количеством.
+    """
     async with httpx.AsyncClient(timeout=5.0) as client:
-        # 1. Запускаем инвентаризацию
+        # Запуск инвентаризации
         start_payload = {
             "type": "Reader-startInventoryRequest",
             "tagFilter": {
@@ -31,10 +35,9 @@ async def poll_reader():
             print(f"Ошибка при запуске: {e}")
             return
 
-        # 2. Цикл опроса
+        # Цикл опроса
         while not state.state.stop_requested:
             try:
-                # Опрос: POST с пустым телом
                 poll_resp = await client.post(
                     config.READER_BASE_URL + config.READER_POLL_URL,
                     headers={"Content-Type": "application/x-www-form-urlencoded"}
@@ -42,11 +45,22 @@ async def poll_reader():
                 if poll_resp.status_code == 200:
                     data = poll_resp.json()
                     tags = data.get("data", [])
-                    if tags:
-                        for tag in tags:
-                            epc = tag.get("epcHex")
-                            if epc:
-                                await process_tag(epc)
+                    count = len(tags)
+
+                    result = {
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        "tags": [
+                            {
+                                "epc": tag.get("epcHex"),
+                                "signal": tag.get("rssi")
+                            }
+                            for tag in tags
+                        ]
+                    }
+
+                    state.state.last_reader_data = result
+                    await manager.broadcast(result)
+
                 else:
                     print(f"Ошибка опроса: {poll_resp.status_code}")
             except httpx.TimeoutException:
@@ -57,7 +71,7 @@ async def poll_reader():
 
             await asyncio.sleep(config.POLL_INTERVAL)
 
-        # 3. Остановка инвентаризации
+        # Остановка инвентаризации
         stop_payload = {"type": "Reader-stopInventoryRequest"}
         try:
             await client.post(
@@ -68,15 +82,3 @@ async def poll_reader():
         except:
             pass
         state.state.is_running = False
-
-async def process_tag(epc: str):
-    """Проверяет EPC в БД и логирует результат."""
-    db: Session = SessionLocal()
-    try:
-        ore = crud.get_ore_by_epc(db, epc)
-        if ore:
-            print(f"[{epc}] Найдена руда: {ore.ore_name} (категория: {ore.ore_category})")
-        else:
-            print(f"[{epc}] Неизвестная метка")
-    finally:
-        db.close()
